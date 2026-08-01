@@ -1,5 +1,7 @@
 # 🐰 KariPom Desktop
 
+![KariPom Desktop](karipom-desktop.png)
+
 ChatGPTの声に合わせて、画面のキャラクターがリアルタイムに口パク！
 KariPom Desktopは、PCから再生される音声を解析し、画面上の「かりポム」が声に合わせて口を動かすデスクトップアプリです。
 瞬きしたり、鼻をヒクヒクさせたりしながら、ChatGPTとの音声会話をちょっと楽しくします。
