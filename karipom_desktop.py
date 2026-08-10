@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =============================================================================
-# KariPom Desktop v0.3 - 7 Visualizers + Face
+# KariPom Desktop v0.4 - 7 Visualizers + Face
 # PCだけで「かりポム」を体験するスピンアウト版
 #
 # ベース:
@@ -13,6 +13,11 @@
 #   * 開口時は赤い楕円を±2px揺らす
 #   * 実機同様の通常顔、瞬き、二重瞬き、鼻ヒクヒク
 #   * CoreS3 / Arduino / UDP / IP設定は不要
+#
+# v0.4:
+#   * Audio Haloを正円化（2026-08-10本家/Companion最新仕様）
+#   * Kaleidoscopeを小型・白背景・低速回転＋音声変形主体へ更新
+#   * Analog VUをアーチ型メーター＋最新針応答へ更新
 #
 # 必要パッケージ:
 #   共通            : pip install numpy PyQt5
@@ -549,7 +554,11 @@ class KariPomWindow(QWidget):
         self.kal_rot = 0.0
         self.kal_pulse = 0.0
         self.kal_bass_avg = 0.0
+        self.kal_level_fast = 0.0
+        self.kal_phase = [0.0, 1.3, 2.7, 4.1]
+        self.kal_period = [15.0, 18.0, 21.0, 13.0]
         self.avu_needle = np.zeros(8, dtype=float)
+        self.avu_level_env = 0.0
         self.tetro_pieces = []
         self.tetro_last_spawn = 0
         self.tetro_bass_avg = 0.0
@@ -561,7 +570,7 @@ class KariPomWindow(QWidget):
         self.blink_events: list[tuple[int, str]] = []
 
         self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-        self.setWindowTitle("KariPom Desktop v0.3  [Face]  • Always on top")
+        self.setWindowTitle("KariPom Desktop v0.4  [Face]  • Always on top")
         self.setFixedSize(CANVAS_W * scale, CANVAS_H * scale)
         self.setAttribute(Qt.WA_OpaquePaintEvent, True)
 
@@ -616,17 +625,27 @@ class KariPomWindow(QWidget):
         # Mirror color phase
         self.mw_phase = (self.mw_phase + 0.02 + level * 0.30) % 6.0
 
-        # Kaleidoscope bass pulse
+        # 2026-08-10 latest Kaleidoscope: bass pulse + very slow rotation.
         self.kal_bass_avg += (bass - self.kal_bass_avg) * 0.15
         if bass > self.kal_bass_avg * 1.3 + 0.04:
             self.kal_pulse = 1.0
         self.kal_pulse *= 0.65
-        self.kal_rot = (self.kal_rot + 0.014) % (2.0 * math.pi)
+        self.kal_level_fast += (level - self.kal_level_fast) * (0.50 if level > self.kal_level_fast else 0.18)
+        self.kal_rot = (self.kal_rot + 0.004 * (20.0 / 70.0)) % (2.0 * math.pi)
 
-        # Analog VU needle smoothing
-        gained = np.clip(fft01 * np.array(EQ_GAIN8), 0.0, 1.3)
+        # 2026-08-10 latest Analog VU: absolute + relative spectrum contribution.
+        gained = np.clip(fft01 * np.asarray(EQ_GAIN8), 0.0, 1.5)
+        mean = float(np.mean(gained))
+        self.avu_level_env += (level - self.avu_level_env) * (0.50 if level > self.avu_level_env else 0.18)
+        gate = float(np.clip((self.avu_level_env - 0.012) / 0.040, 0.0, 1.0))
+        rel_den = max(mean, 0.060)
         for i in range(8):
-            target = float(min(1.0, gained[i] / 1.30))
+            target = 0.0
+            if gained[i] >= 0.020:
+                a_abs = min(1.0, float(gained[i]) / 1.30)
+                ratio = float(gained[i]) / rel_den
+                a_rel = float(np.clip((ratio - 0.35) / (1.90 - 0.35), 0.0, 1.0))
+                target = min(1.0, gate * (0.55 * a_abs + 0.60 * a_rel))
             coef = 0.60 if target > self.avu_needle[i] else 0.14
             self.avu_needle[i] += (target - self.avu_needle[i]) * coef
 
@@ -634,7 +653,7 @@ class KariPomWindow(QWidget):
         self._update_tetromino(now, fft01, level, bass)
 
         mode_label = VIS_MODES[self.display_mode]
-        title = f"KariPom Desktop v0.3  [{mode_label}]  • Always on top"
+        title = f"KariPom Desktop v0.4  [{mode_label}]  • Always on top"
         if error:
             title += "  [Audio Error]"
         elif speaking:
@@ -829,12 +848,14 @@ class KariPomWindow(QWidget):
         self._draw_face(painter)
 
     def _draw_halo(self, painter: QPainter, fft_levels) -> None:
-        vals = np.clip(np.asarray(fft_levels, dtype=float) / 100.0, 0, 1)
+        # 2026-08-10 latest CoreS3/Companion look: true circle, not flattened ellipse.
+        vals = np.clip(np.asarray(fft_levels, dtype=float) / 100.0, 0.0, 1.0)
         peak = float(vals.max())
         self.halo_agc_peak += (peak - self.halo_agc_peak) * (1.0 if peak > self.halo_agc_peak else 0.03)
         ref = max(0.21, self.halo_agc_peak)
         agc = 0.64 / ref
         cx, cy = 160.0, 143.0
+        rin, rout = 62.0, 93.0
         for j in range(48):
             rel = j / 47.0
             fold = min(rel * 2.0, 2.0 - rel * 2.0)
@@ -843,20 +864,19 @@ class KariPomWindow(QWidget):
                 v = 0.0
             elif v < 0.065:
                 v *= (v - 0.02) / 0.045
-            v = v ** 0.48 if v > 0 else 0
-            a = math.radians(90 + j * 360.0 / 48.0)
+            if v > 0.0:
+                v = v ** 0.48
+            a = math.radians(90.0 + j * 360.0 / 48.0)
             dx, dy = math.cos(a), math.sin(a)
-            rin = 1.0 / math.sqrt((dx/84.0)**2 + (dy/40.0)**2)
-            rout = 1.0 / math.sqrt((dx/157.0)**2 + (dy/93.0)**2)
-            r2 = rin + (rout-rin)*v
+            r2 = rin + (rout - rin) * v
             base = self._spectrum_color(fold)
-            for frac, tint, width in ((0.45,82,8),(0.70,58,7),(0.88,28,6),(1.0,0,4)):
-                rr = rin + (r2-rin)*frac
+            for frac, tint, width in ((0.45, 82, 8), (0.70, 58, 7), (0.88, 28, 6), (1.0, 0, 4)):
+                rr = rin + (r2 - rin) * frac
                 pen = QPen(self._tint(base, tint))
                 pen.setWidth(width)
                 pen.setCapStyle(Qt.RoundCap)
                 painter.setPen(pen)
-                painter.drawLine(int(cx+dx*rin), int(cy+dy*rin), int(cx+dx*rr), int(cy+dy*rr))
+                painter.drawLine(int(cx + dx * rin), int(cy + dy * rin), int(cx + dx * rr), int(cy + dy * rr))
         self._draw_face(painter)
 
     @staticmethod
@@ -910,42 +930,80 @@ class KariPomWindow(QWidget):
         # 顔を最後に描いて最前面へ。
         self._draw_face(painter)
 
-    def _draw_kaleido(self, painter: QPainter, fft_levels) -> None:
-        painter.fillRect(0, SCENE_TOP, CANVAS_W, CANVAS_H-SCENE_TOP, QColor("black"))
-        vals = np.clip(np.asarray(fft_levels,dtype=float)/100.0,0,1)
-        mean = max(0.05,float(vals.mean()))
-        pulse = 1.0 + 0.10*self.kal_pulse
+    def _draw_kaleido(self, painter: QPainter, fft_levels, now_sec: float) -> None:
+        # 2026-08-10 latest compact Kaleidoscope: small, white, slow, audio-led.
+        painter.fillRect(0, SCENE_TOP, CANVAS_W, CANVAS_H - SCENE_TOP, QColor("white"))
         painter.save()
-        painter.setClipRect(0,SCENE_TOP,CANVAS_W,CANVAS_H-SCENE_TOP)
-        cx,cy=160,144
-        radii=[35,75,125,190]
-        prev=0
+        painter.setClipRect(0, SCENE_TOP, CANVAS_W, CANVAS_H - SCENE_TOP)
+        vals = np.clip(np.asarray(fft_levels, dtype=float) / 100.0, 0.0, 1.0)
+        gained = vals * np.asarray(EQ_GAIN8)
+        mean = float(np.mean(gained))
+        gate = float(np.clip((self.kal_level_fast - 0.015) / 0.05, 0.0, 1.0))
+        loud_trim = 0.55 + 0.45 * min(1.0, self.kal_level_fast / 0.35)
+        amp = gate * loud_trim
+        pulse = 1.0 + 0.10 * self.kal_pulse
+        gaps_min = (20.0, 24.0, 28.0, 34.0)
+        gaps_max = (26.0, 30.0, 36.0, 44.0)
+        cx, cy = 160.0, 144.0
+        r_prev = 0.0
+
+        def rel_shape(v: float) -> float:
+            denom = max(mean, 0.05)
+            ratio = max(-2.5, min(2.5, (float(v) - mean) / denom))
+            mag = math.sqrt(abs(ratio) * 1.3)
+            return max(-1.3, min(1.3, mag if ratio >= 0 else -mag))
+
         for ring in range(4):
-            v1=(vals[ring*2]/mean-1.0)
-            v2=(vals[ring*2+1]/mean-1.0)
-            r=radii[ring]*pulse + max(-22,min(22,v1*22))
-            angofs=max(-0.35,min(0.35,v2*0.25))
+            wave = 0.5 + 0.5 * math.sin((now_sec / self.kal_period[ring]) * 2.0 * math.pi + self.kal_phase[ring])
+            gap = gaps_min[ring] + (gaps_max[ring] - gaps_min[ring]) * wave
+            r_in = r_prev * pulse
+            r_out = (r_prev + gap) * pulse
+            r_prev += gap
+            shape_r = rel_shape(gained[ring * 2])
+            shape_a = rel_shape(gained[ring * 2 + 1])
+            frac_base = 0.38 + 0.24 * (0.5 + 0.5 * math.sin((now_sec / (self.kal_period[ring] * 1.17)) * 2.0 * math.pi + self.kal_phase[ring]))
+            r_f = r_in + (r_out - r_in) * frac_base + shape_r * amp * 45.0 + self.kal_pulse * 22.0
+            margin = max(3.0, (r_out - r_in) * 0.12)
+            r_f = max(r_in + margin, min(r_out - margin, r_f))
+            base_ang = math.radians(10.0 + 10.0 * wave)
+            ang = max(math.radians(2.0), min(math.radians(28.0), base_ang + shape_a * amp * 0.55))
+            in0 = (r_in, 0.0)
+            in1 = (r_in * math.cos(math.pi / 6), r_in * math.sin(math.pi / 6))
+            out0 = (r_out, 0.0)
+            out1 = (r_out * math.cos(math.pi / 6), r_out * math.sin(math.pi / 6))
+            fp = (r_f * math.cos(ang), r_f * math.sin(ang))
+            audio_avg = (abs(shape_r) + abs(shape_a)) * 0.5 * amp
+            hue_spread = 1.0 + audio_avg * 0.9
+            white_boost = min(92.0, 8.0 + audio_avg * 42.0 + self.kal_pulse * 55.0)
+            colors = [self._tint(self._spectrum_color((ring * 0.22 + ofs * hue_spread) % 1.0), white_boost) for ofs in (0.00, 0.05, 0.10, 0.15)]
+            tris = ((in0, in1, fp), (in1, out1, fp), (out1, out0, fp), (out0, in0, fp))
             for sec in range(6):
-                base=self.kal_rot + sec*math.pi/3
-                for facet in range(4):
-                    a0=base + facet*(math.pi/12) + angofs*(facet%2)
-                    a1=base + (facet+1)*(math.pi/12) + angofs*((facet+1)%2)
-                    p0=(int(cx+math.cos(a0)*prev),int(cy+math.sin(a0)*prev))
-                    p1=(int(cx+math.cos(a1)*prev),int(cy+math.sin(a1)*prev))
-                    p2=(int(cx+math.cos(a1)*r),int(cy+math.sin(a1)*r))
-                    p3=(int(cx+math.cos(a0)*r),int(cy+math.sin(a0)*r))
-                    col=self._spectrum_color((ring*2+(facet%2))/7.0)
-                    painter.setPen(Qt.NoPen); painter.setBrush(QBrush(col))
-                    painter.drawPolygon(*[self._qp(*p) for p in (p0,p1,p2,p3)])
-            prev=r
+                sec_a = sec * math.pi / 3.0
+                cs, ss = math.cos(sec_a), math.sin(sec_a)
+                cr, sr = math.cos(self.kal_rot), math.sin(self.kal_rot)
+                for mirrored in (False, True):
+                    for tri, col in zip(tris, colors):
+                        pts = []
+                        for x, y in tri:
+                            if mirrored:
+                                y = -y
+                            tx, ty = x * cs - y * ss, x * ss + y * cs
+                            fx, fy = tx * cr - ty * sr, tx * sr + ty * cr
+                            pts.append((cx + fx, cy + fy))
+                        self._poly(painter, pts, col)
         painter.restore()
-        # 黒背景でも顔を読めるよう白リムを付ける。
-        self._draw_face_with_rim(painter)
+        self._draw_face(painter)
 
     @staticmethod
-    def _qp(x,y):
+    def _qp(x, y):
         from PyQt5.QtCore import QPoint
-        return QPoint(int(x),int(y))
+        return QPoint(int(round(x)), int(round(y)))
+
+    @classmethod
+    def _poly(cls, painter: QPainter, points, color: QColor) -> None:
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(color))
+        painter.drawPolygon(*[cls._qp(x, y) for x, y in points])
 
     def _draw_face_with_rim(self,painter):
         # 白で一回太め→通常黒/赤を重ねる簡易リム
@@ -958,34 +1016,87 @@ class KariPomWindow(QWidget):
         self._draw_face(painter)
 
     def _draw_analog_vu(self, painter: QPainter) -> None:
-        painter.fillRect(0,SCENE_TOP,CANVAS_W,CANVAS_H-SCENE_TOP,QColor("black"))
-        labels=("60","120","250","500","1k","2k","4k","8k")
-        cream=QColor(245,230,200); frame=QColor(35,35,35); red=QColor(240,0,0)
+        # 2026-08-10 latest arch-top meter faces.
+        painter.fillRect(0, SCENE_TOP, CANVAS_W, CANVAS_H - SCENE_TOP, QColor("white"))
+        cream = QColor(245, 230, 200)
+        frame = QColor(33, 36, 36)
+        bezel = QColor(82, 82, 82)
+        red_zone = QColor(192, 0, 0)
+        needle = QColor(248, 0, 0)
+        labels = ("L1", "L2", "M1", "M2", "M3", "M4", "H1", "H2")
         for b in range(8):
-            col,row=b%4,b//4
-            x0,y0=col*80,row*96+SCENE_TOP
-            px,py=x0+40,y0+74
-            painter.setPen(QPen(QColor(82,82,82),2)); painter.setBrush(QBrush(cream))
-            painter.drawRoundedRect(x0+3,y0+8,74,76,5,5)
-            painter.setPen(QPen(frame,1))
-            # arc/ticks
-            for t in range(7):
-                ang=math.radians(-55+t*(110/6))
-                x1=px+math.sin(ang)*34; y1=py-math.cos(ang)*34
-                x2=px+math.sin(ang)*42; y2=py-math.cos(ang)*42
-                painter.drawLine(int(x1),int(y1),int(x2),int(y2))
-            # red zone
-            painter.setPen(QPen(QColor(190,0,0),3))
-            for deg in np.linspace(28,55,12):
-                a=math.radians(deg)
-                painter.drawLine(int(px+math.sin(a)*38),int(py-math.cos(a)*38),int(px+math.sin(a)*42),int(py-math.cos(a)*42))
-            # needle
-            a=math.radians(-55+110*float(self.avu_needle[b]))
-            painter.setPen(QPen(red,2))
-            painter.drawLine(px,py,int(px+math.sin(a)*38),int(py-math.cos(a)*38))
-            painter.setBrush(QBrush(frame)); painter.setPen(Qt.NoPen); painter.drawEllipse(px-3,py-3,6,6)
-            painter.setPen(QPen(frame,1)); painter.drawText(x0+29,y0+40,labels[b])
-        self._draw_face_with_rim(painter)
+            col, row = b % 4, b // 4
+            cx0, cy0 = col * 80, SCENE_TOP + row * 96
+            px, py = cx0 + 3, cy0 + 8
+            vx, vy = cx0 + 40, cy0 + 74
+            panel_w, panel_h = 74, 76
+            face_r = 44
+            panel_bottom = py + panel_h - 1
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(cream))
+            prev_top = None
+            for lx in range(panel_w):
+                sx = px + lx
+                dx = sx - vx
+                rr = max(0, face_r * face_r - dx * dx)
+                top_y = vy - int(round(math.sqrt(rr)))
+                painter.drawRect(sx, top_y, 1, panel_bottom - top_y + 1)
+                if prev_top is not None:
+                    painter.setPen(QPen(frame, 1))
+                    painter.drawLine(prev_top[0], prev_top[1], sx, top_y)
+                    painter.setPen(Qt.NoPen)
+                prev_top = (sx, top_y)
+            def arch_y(sx: int, radius: int) -> int:
+                rr = max(0, radius * radius - (sx - vx) ** 2)
+                return vy - int(round(math.sqrt(rr)))
+            right_x = px + panel_w - 1
+            painter.setPen(QPen(frame, 1))
+            painter.drawLine(px, arch_y(px, face_r), px, panel_bottom)
+            painter.drawLine(right_x, arch_y(right_x, face_r), right_x, panel_bottom)
+            painter.drawLine(px, panel_bottom, right_x, panel_bottom)
+            prev = None
+            for lx in range(-1, panel_w + 1):
+                sx = px + lx
+                dx = sx - vx
+                rr = (face_r + 1) ** 2 - dx * dx
+                if rr < 0:
+                    continue
+                yy = vy - int(round(math.sqrt(rr)))
+                if prev is not None:
+                    painter.setPen(QPen(bezel, 1))
+                    painter.drawLine(prev[0], prev[1], sx, yy)
+                prev = (sx, yy)
+            arc_pts = []
+            for k in range(13):
+                deg = -55.0 + 110.0 * k / 12.0
+                a = math.radians(deg)
+                arc_pts.append((vx + math.sin(a) * 42, vy - math.cos(a) * 42))
+            painter.setPen(QPen(frame, 1))
+            for p0, p1 in zip(arc_pts[:-1], arc_pts[1:]):
+                painter.drawLine(int(p0[0]), int(p0[1]), int(p1[0]), int(p1[1]))
+            painter.setPen(QPen(red_zone, 2))
+            for k in range(16):
+                t = 0.75 + 0.25 * k / 15.0
+                a = math.radians(-55.0 + 110.0 * t)
+                painter.drawLine(int(vx + math.sin(a) * 38), int(vy - math.cos(a) * 38), int(vx + math.sin(a) * 42), int(vy - math.cos(a) * 42))
+            for k in range(7):
+                t = k / 6.0
+                a = math.radians(-55.0 + 110.0 * t)
+                painter.setPen(QPen(red_zone if t >= 0.75 else frame, 1))
+                painter.drawLine(int(vx + math.sin(a) * 34), int(vy - math.cos(a) * 34), int(vx + math.sin(a) * 42), int(vy - math.cos(a) * 42))
+            painter.setPen(QPen(frame, 1))
+            painter.drawText(cx0 + 17, cy0 + 80, labels[b])
+            painter.drawText(cx0 + 53, cy0 + 80, "VU")
+            a = math.radians(-55.0 + 110.0 * float(self.avu_needle[b]))
+            sx, sy = math.sin(a), -math.cos(a)
+            pxp, pyp = math.cos(a), math.sin(a)
+            tip = (vx + sx * 38.0, vy + sy * 38.0)
+            b1 = (vx + pxp, vy + pyp)
+            b2 = (vx - pxp, vy - pyp)
+            self._poly(painter, (b1, b2, tip), needle)
+            self._fill_circle(painter, vx, vy, 3, frame)
+            self._fill_circle(painter, vx, vy, 1, bezel)
+        self._draw_face(painter)
 
     def _draw_tetromino(self, painter: QPainter) -> None:
         painter.save(); painter.setClipRect(0,SCENE_TOP,CANVAS_W,CANVAS_H-SCENE_TOP)
@@ -1012,6 +1123,7 @@ class KariPomWindow(QWidget):
         painter.scale(self.scale_factor, self.scale_factor)
 
         _speaking, _rms, _error, fft_levels = self.audio_state.snapshot()
+        now_sec = time.monotonic()
 
         if self.display_mode == 0:
             self._draw_face(painter)
@@ -1024,7 +1136,7 @@ class KariPomWindow(QWidget):
         elif self.display_mode == 4:
             self._draw_rhythm(painter)
         elif self.display_mode == 5:
-            self._draw_kaleido(painter, fft_levels)
+            self._draw_kaleido(painter, fft_levels, now_sec)
         elif self.display_mode == 6:
             self._draw_analog_vu(painter)
         elif self.display_mode == 7:
@@ -1055,7 +1167,7 @@ def print_devices() -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="KariPom Desktop v0.3 - 7 Visualizers + Face")
+    parser = argparse.ArgumentParser(description="KariPom Desktop v0.4 - 7 Visualizers + Face")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,
                         help=f"口パク開始RMSしきい値（既定 {DEFAULT_THRESHOLD}）")
     parser.add_argument("--input", dest="input_hint", default=None,
@@ -1076,7 +1188,7 @@ def main() -> int:
         print_devices()
         return 0
 
-    print("=== KariPom Desktop v0.3 - 7 Visualizers + Face ===")
+    print("=== KariPom Desktop v0.4 - 7 Visualizers + Face ===")
     print(f"OS: {OS_NAME}")
     print(f"Threshold: {args.threshold}")
     if IS_MAC:
