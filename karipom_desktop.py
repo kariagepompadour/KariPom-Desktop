@@ -34,9 +34,9 @@
 #
 # 必要パッケージ:
 #   共通            : pip install numpy PyQt5
-#   macOS           : 追加オーディオドライバ不要（ScreenCaptureKitを使用）
-#                     ※開発用.pyの初回実行時のみ、Swift helperのビルドにXcode Command Line Toolsが必要
-#                       （将来の.app配布版ではhelperを同梱予定）
+#   macOS           : 追加オーディオドライバ不要（ScreenCaptureKitを使用）。
+#                     ScreenCaptureKit helperは resources/ に事前ビルド済みバイナリを
+#                     同梱しているため、Xcode / Command Line Tools / Swift compilerは不要
 #   Windows / Linux : pip install soundcard
 #   Linux           : libpulse0（PipeWire環境は pipewire-pulse も）
 # =============================================================================
@@ -45,7 +45,6 @@ from __future__ import annotations
 
 import argparse
 import datetime
-import hashlib
 import locale
 import math
 import os
@@ -1242,116 +1241,31 @@ class SpeechDetector:
         self.on_state(False, 0.0)
 
 
-MAC_SCK_HELPER_SOURCE = r'''
-import Foundation
-import ScreenCaptureKit
-import CoreMedia
-import AudioToolbox
+def locate_mac_sck_helper() -> "Path":
+    """resources/ に同梱された、事前ビルド済みScreenCaptureKit音声helper
+    （Universal Binary: arm64/x86_64）の実行ファイルパスを返す。
 
-@available(macOS 13.0, *)
-final class KariPomAudioOutput: NSObject, SCStreamOutput {
-    private let stdout = FileHandle.standardOutput
-
-    func stream(_ stream: SCStream,
-                didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
-                of outputType: SCStreamOutputType) {
-        guard outputType == .audio,
-              CMSampleBufferIsValid(sampleBuffer),
-              CMSampleBufferGetNumSamples(sampleBuffer) > 0,
-              let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
-              let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription)
-        else { return }
-
-        let asbd = asbdPtr.pointee
-        guard asbd.mFormatID == kAudioFormatLinearPCM,
-              (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0,
-              asbd.mBitsPerChannel == 32
-        else {
-            fputs("UNSUPPORTED_AUDIO_FORMAT\n", stderr)
-            return
-        }
-
-        var blockBuffer: CMBlockBuffer?
-        var audioBufferList = AudioBufferList(
-            mNumberBuffers: 1,
-            mBuffers: AudioBuffer(mNumberChannels: 1, mDataByteSize: 0, mData: nil)
+    Swiftソースは resources/karipom_sck_helper.swift、ビルド手順は
+    resources/build_helper.sh を参照。ビルドは開発者が一度だけ実行してバイナリを
+    リポジトリへコミットするものであり、一般ユーザーの実行時にswiftc/Xcode
+    Command Line Toolsを必要としない（helperは配布物に同梱済み）。
+    将来の.app配布版では、この関数がアプリバンドル内Resourcesを指すよう
+    差し替えるだけでよい。
+    """
+    helper_path = Path(__file__).resolve().parent / "resources" / "karipom_sck_helper"
+    if not helper_path.exists():
+        raise FileNotFoundError(
+            f"ScreenCaptureKit helperが見つかりません: {helper_path}\n"
+            "resources/karipom_sck_helper が配布物に含まれているか確認してください"
+            "（resources/build_helper.sh で生成できます）。"
         )
-        let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-            sampleBuffer,
-            bufferListSizeNeededOut: nil,
-            bufferListOut: &audioBufferList,
-            bufferListSize: MemoryLayout<AudioBufferList>.size,
-            blockBufferAllocator: kCFAllocatorDefault,
-            blockBufferMemoryAllocator: kCFAllocatorDefault,
-            flags: UInt32(kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment),
-            blockBufferOut: &blockBuffer
-        )
-        guard status == noErr,
-              audioBufferList.mNumberBuffers >= 1,
-              let data = audioBufferList.mBuffers.mData
-        else { return }
-        stdout.write(Data(bytes: data, count: Int(audioBufferList.mBuffers.mDataByteSize)))
-    }
-}
+    if not os.access(helper_path, os.X_OK):
+        try:
+            helper_path.chmod(helper_path.stat().st_mode | 0o111)
+        except OSError:
+            pass
+    return helper_path
 
-@available(macOS 13.0, *)
-final class KariPomCaptureDelegate: NSObject, SCStreamDelegate {
-    func stream(_ stream: SCStream, didStopWithError error: Error) {
-        fputs("STREAM_STOPPED: \(error.localizedDescription)\n", stderr)
-        fflush(stderr)
-        exit(3)
-    }
-}
-
-@available(macOS 13.0, *)
-func startCapture() async throws -> (SCStream, KariPomAudioOutput, KariPomCaptureDelegate) {
-    let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-    guard let display = content.displays.first else {
-        throw NSError(domain: "KariPomScreenCapture", code: 1,
-                      userInfo: [NSLocalizedDescriptionKey: "No display is available for capture."])
-    }
-
-    let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
-    let config = SCStreamConfiguration()
-    config.capturesAudio = true
-    config.sampleRate = 44100
-    config.channelCount = 1
-    config.excludesCurrentProcessAudio = true
-    // 画面フレームは受け取らないが、最小構成にしてScreenCaptureKitの負荷を抑える。
-    config.width = 2
-    config.height = 2
-    config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
-    config.queueDepth = 1
-
-    let output = KariPomAudioOutput()
-    let delegate = KariPomCaptureDelegate()
-    let stream = SCStream(filter: filter, configuration: config, delegate: delegate)
-    let queue = DispatchQueue(label: "jp.karipom.desktop.audio")
-    try stream.addStreamOutput(output, type: .audio, sampleHandlerQueue: queue)
-    try await stream.startCapture()
-    fputs("READY\n", stderr)
-    fflush(stderr)
-    return (stream, output, delegate)
-}
-
-if #available(macOS 13.0, *) {
-    var retained: (SCStream, KariPomAudioOutput, KariPomCaptureDelegate)?
-    Task {
-        do {
-            retained = try await startCapture()
-        } catch {
-            let ns = error as NSError
-            fputs("START_ERROR: domain=\(ns.domain) code=\(ns.code) \(error.localizedDescription)\n", stderr)
-            fflush(stderr)
-            exit(2)
-        }
-    }
-    RunLoop.main.run()
-} else {
-    fputs("UNSUPPORTED_MACOS: macOS 13 or later is required.\n", stderr)
-    exit(4)
-}
-'''
 
 class AudioEngine:
     """Talk最終版のOS別PC再生音取得をGUI向けバックグラウンド処理にしたもの。"""
@@ -1418,7 +1332,7 @@ class AudioEngine:
 
         Returns:
             (ok, code, detail)
-            code: OK / UNSUPPORTED_MACOS / MISSING_SWIFTC / MAC_HELPER_BUILD_ERROR /
+            code: OK / UNSUPPORTED_MACOS / MISSING_HELPER_BINARY /
                   MISSING_SOUNDCARD / MISSING_LOOPBACK / AUDIO_CHECK_ERROR
         """
         try:
@@ -1426,11 +1340,9 @@ class AudioEngine:
                 if tuple(int(v) for v in platform.mac_ver()[0].split(".")[:2] if v.isdigit()) < (13, 0):
                     return False, "UNSUPPORTED_MACOS", "ScreenCaptureKit audio requires macOS 13 or later"
                 try:
-                    helper_path = self._ensure_macos_capture_helper()
-                except FileNotFoundError as exc:
-                    return False, "MISSING_SWIFTC", str(exc)
+                    helper_path = locate_mac_sck_helper()
                 except Exception as exc:
-                    return False, "MAC_HELPER_BUILD_ERROR", f"{type(exc).__name__}: {exc}"
+                    return False, "MISSING_HELPER_BINARY", str(exc)
                 return True, "OK", str(helper_path)
 
             if sc is None:
@@ -1471,57 +1383,6 @@ class AudioEngine:
 
     # ----- macOS / ScreenCaptureKit -----
     @staticmethod
-    def _mac_helper_dir() -> Path:
-        return Path.home() / "Library" / "Caches" / "KariPomDesktop" / "ScreenCaptureKit"
-
-    def _ensure_macos_capture_helper(self) -> Path:
-        """開発用.py向けにScreenCaptureKit音声helperを一度だけビルドする。
-
-        将来の.app版ではこの実行ファイルをアプリに同梱し、このビルド工程自体を不要にする。
-        """
-        helper_dir = self._mac_helper_dir()
-        helper_dir.mkdir(parents=True, exist_ok=True)
-        source_path = helper_dir / "karipom_sck_audio.swift"
-        binary_path = helper_dir / "karipom_sck_audio"
-        stamp_path = helper_dir / "source.sha256"
-        digest = hashlib.sha256(MAC_SCK_HELPER_SOURCE.encode("utf-8")).hexdigest()
-
-        if binary_path.exists() and stamp_path.exists() and stamp_path.read_text().strip() == digest:
-            return binary_path
-
-        swiftc = shutil.which("swiftc")
-        if swiftc is None:
-            xcrun = shutil.which("xcrun")
-            if xcrun is not None:
-                probe = subprocess.run(
-                    [xcrun, "--find", "swiftc"], capture_output=True, text=True, check=False
-                )
-                if probe.returncode == 0:
-                    swiftc = probe.stdout.strip()
-        if not swiftc:
-            raise FileNotFoundError(
-                "Swift compilerが見つかりません。開発用.pyの検証にはXcode Command Line Toolsが必要です。"
-            )
-
-        source_path.write_text(MAC_SCK_HELPER_SOURCE, encoding="utf-8")
-        cmd = [
-            swiftc,
-            str(source_path),
-            "-O",
-            "-framework", "Foundation",
-            "-framework", "ScreenCaptureKit",
-            "-framework", "CoreMedia",
-            "-framework", "AudioToolbox",
-            "-o", str(binary_path),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout or "swiftc failed").strip()
-            raise RuntimeError(detail)
-        stamp_path.write_text(digest, encoding="utf-8")
-        return binary_path
-
-    @staticmethod
     def _is_sck_permission_denied(detail: str) -> bool:
         s = (detail or "").lower()
         markers = (
@@ -1536,7 +1397,7 @@ class AudioEngine:
         restart_delay = 1.0
         while not self.stop_event.is_set():
             try:
-                helper_path = self._ensure_macos_capture_helper()
+                helper_path = locate_mac_sck_helper()
             except Exception as exc:
                 msg = f"ScreenCaptureKit helper error: {type(exc).__name__}: {exc}"
                 self.state.set_error(msg, "SCK_HELPER_ERROR")
@@ -8482,15 +8343,13 @@ class KariPomWindow(QWidget):
             box.setInformativeText(
                 "BlackHoleを使わないKariPom DesktopのMac音声取得にはmacOS 13以降が必要です。"
             )
-        elif code == "MISSING_SWIFTC":
-            box.setText("開発用ScreenCaptureKit helperを準備できません。")
+        elif code == "MISSING_HELPER_BINARY":
+            box.setText("ScreenCaptureKit helperが見つかりません。")
             box.setInformativeText(
-                "この.py検証版では初回だけXcode Command Line ToolsのSwift compilerが必要です。\n\n"
-                "将来の.app配布版ではhelperを同梱するため、この準備は不要になります。"
+                f"{detail}\n\n"
+                "resources/ に同梱されているはずのhelperが見当たりません。"
+                "配布物（リポジトリ）が壊れていないか確認し、KariPom Desktopを再起動してください。"
             )
-        elif code == "MAC_HELPER_BUILD_ERROR":
-            box.setText("ScreenCaptureKit helperのビルドに失敗しました。")
-            box.setInformativeText(f"{detail}\n\n設定を確認後、KariPom Desktopを再起動してください。")
         elif code == "MISSING_SOUNDCARD":
             box.setText("Windows/Linux用の音声ライブラリ soundcard が見つかりません。")
             extra = "\nLinuxでは libpulse0（PipeWire環境では pipewire-pulse）も確認してください。" if IS_LINUX else ""
