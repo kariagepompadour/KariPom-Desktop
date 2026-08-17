@@ -34,8 +34,9 @@
 #
 # 必要パッケージ:
 #   共通            : pip install numpy PyQt5
-#   macOS           : pip install sounddevice
-#                     + BlackHole 2ch と Audio MIDI設定の「複数出力装置」
+#   macOS           : 追加オーディオドライバ不要（ScreenCaptureKitを使用）
+#                     ※開発用.pyの初回実行時のみ、Swift helperのビルドにXcode Command Line Toolsが必要
+#                       （将来の.app配布版ではhelperを同梱予定）
 #   Windows / Linux : pip install soundcard
 #   Linux           : libpulse0（PipeWire環境は pipewire-pulse も）
 # =============================================================================
@@ -44,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import locale
 import math
 import os
@@ -56,6 +58,7 @@ import threading
 import time
 import webbrowser
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
@@ -81,16 +84,10 @@ if not (IS_MAC or IS_WINDOWS or IS_LINUX):
     print(f"未対応OSです: {OS_NAME}")
     raise SystemExit(1)
 
-# 音声ライブラリはVisualizer/PC音声反応のための任意依存。
-# 未導入でもKariPom Desktop自体は起動し、Visualizer選択時に案内する。
-sd = None
+# Windows / Linuxの音声ライブラリは任意依存。
+# macOSはBlackHole/sounddeviceを使わず、Apple純正ScreenCaptureKitでPC再生音を取得する。
 sc = None
-if IS_MAC:
-    try:
-        import sounddevice as sd
-    except ImportError:
-        pass
-else:
+if not IS_MAC:
     try:
         import soundcard as sc
     except ImportError:
@@ -1160,6 +1157,7 @@ class SharedAudioState:
         self._speaking = False
         self._rms = 0.0
         self._error = ""
+        self._error_code = ""
         self._fft = np.zeros(8, dtype=np.float32)
 
     def set_audio(self, speaking: bool, rms: float) -> None:
@@ -1174,9 +1172,19 @@ class SharedAudioState:
         with self._lock:
             self._fft = arr.copy()
 
-    def set_error(self, message: str) -> None:
+    def set_error(self, message: str, code: str = "") -> None:
         with self._lock:
             self._error = message
+            self._error_code = code
+
+    def error_info(self) -> tuple[str, str]:
+        with self._lock:
+            return self._error_code, self._error
+
+    def clear_error(self) -> None:
+        with self._lock:
+            self._error = ""
+            self._error_code = ""
 
     def snapshot(self) -> tuple[bool, float, str, np.ndarray]:
         with self._lock:
@@ -1233,6 +1241,117 @@ class SpeechDetector:
         self.hard_silence_start_time = None
         self.on_state(False, 0.0)
 
+
+MAC_SCK_HELPER_SOURCE = r'''
+import Foundation
+import ScreenCaptureKit
+import CoreMedia
+import AudioToolbox
+
+@available(macOS 13.0, *)
+final class KariPomAudioOutput: NSObject, SCStreamOutput {
+    private let stdout = FileHandle.standardOutput
+
+    func stream(_ stream: SCStream,
+                didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
+                of outputType: SCStreamOutputType) {
+        guard outputType == .audio,
+              CMSampleBufferIsValid(sampleBuffer),
+              CMSampleBufferGetNumSamples(sampleBuffer) > 0,
+              let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription)
+        else { return }
+
+        let asbd = asbdPtr.pointee
+        guard asbd.mFormatID == kAudioFormatLinearPCM,
+              (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0,
+              asbd.mBitsPerChannel == 32
+        else {
+            fputs("UNSUPPORTED_AUDIO_FORMAT\n", stderr)
+            return
+        }
+
+        var blockBuffer: CMBlockBuffer?
+        var audioBufferList = AudioBufferList(
+            mNumberBuffers: 1,
+            mBuffers: AudioBuffer(mNumberChannels: 1, mDataByteSize: 0, mData: nil)
+        )
+        let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: nil,
+            bufferListOut: &audioBufferList,
+            bufferListSize: MemoryLayout<AudioBufferList>.size,
+            blockBufferAllocator: kCFAllocatorDefault,
+            blockBufferMemoryAllocator: kCFAllocatorDefault,
+            flags: UInt32(kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment),
+            blockBufferOut: &blockBuffer
+        )
+        guard status == noErr,
+              audioBufferList.mNumberBuffers >= 1,
+              let data = audioBufferList.mBuffers.mData
+        else { return }
+        stdout.write(Data(bytes: data, count: Int(audioBufferList.mBuffers.mDataByteSize)))
+    }
+}
+
+@available(macOS 13.0, *)
+final class KariPomCaptureDelegate: NSObject, SCStreamDelegate {
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        fputs("STREAM_STOPPED: \(error.localizedDescription)\n", stderr)
+        fflush(stderr)
+        exit(3)
+    }
+}
+
+@available(macOS 13.0, *)
+func startCapture() async throws -> (SCStream, KariPomAudioOutput, KariPomCaptureDelegate) {
+    let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+    guard let display = content.displays.first else {
+        throw NSError(domain: "KariPomScreenCapture", code: 1,
+                      userInfo: [NSLocalizedDescriptionKey: "No display is available for capture."])
+    }
+
+    let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
+    let config = SCStreamConfiguration()
+    config.capturesAudio = true
+    config.sampleRate = 44100
+    config.channelCount = 1
+    config.excludesCurrentProcessAudio = true
+    // 画面フレームは受け取らないが、最小構成にしてScreenCaptureKitの負荷を抑える。
+    config.width = 2
+    config.height = 2
+    config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
+    config.queueDepth = 1
+
+    let output = KariPomAudioOutput()
+    let delegate = KariPomCaptureDelegate()
+    let stream = SCStream(filter: filter, configuration: config, delegate: delegate)
+    let queue = DispatchQueue(label: "jp.karipom.desktop.audio")
+    try stream.addStreamOutput(output, type: .audio, sampleHandlerQueue: queue)
+    try await stream.startCapture()
+    fputs("READY\n", stderr)
+    fflush(stderr)
+    return (stream, output, delegate)
+}
+
+if #available(macOS 13.0, *) {
+    var retained: (SCStream, KariPomAudioOutput, KariPomCaptureDelegate)?
+    Task {
+        do {
+            retained = try await startCapture()
+        } catch {
+            let ns = error as NSError
+            fputs("START_ERROR: domain=\(ns.domain) code=\(ns.code) \(error.localizedDescription)\n", stderr)
+            fflush(stderr)
+            exit(2)
+        }
+    }
+    RunLoop.main.run()
+} else {
+    fputs("UNSUPPORTED_MACOS: macOS 13 or later is required.\n", stderr)
+    exit(4)
+}
+'''
 
 class AudioEngine:
     """Talk最終版のOS別PC再生音取得をGUI向けバックグラウンド処理にしたもの。"""
@@ -1299,21 +1418,20 @@ class AudioEngine:
 
         Returns:
             (ok, code, detail)
-            code: OK / MISSING_SOUNDDEVICE / MISSING_BLACKHOLE /
+            code: OK / UNSUPPORTED_MACOS / MISSING_SWIFTC / MAC_HELPER_BUILD_ERROR /
                   MISSING_SOUNDCARD / MISSING_LOOPBACK / AUDIO_CHECK_ERROR
         """
         try:
             if IS_MAC:
-                if sd is None:
-                    return False, "MISSING_SOUNDDEVICE", "sounddevice is not installed"
+                if tuple(int(v) for v in platform.mac_ver()[0].split(".")[:2] if v.isdigit()) < (13, 0):
+                    return False, "UNSUPPORTED_MACOS", "ScreenCaptureKit audio requires macOS 13 or later"
                 try:
-                    devices = sd.query_devices()
+                    helper_path = self._ensure_macos_capture_helper()
+                except FileNotFoundError as exc:
+                    return False, "MISSING_SWIFTC", str(exc)
                 except Exception as exc:
-                    return False, "AUDIO_CHECK_ERROR", f"{type(exc).__name__}: {exc}"
-                for dev in devices:
-                    if "BlackHole" in str(dev.get("name", "")) and int(dev.get("max_input_channels", 0)) > 0:
-                        return True, "OK", str(dev.get("name", "BlackHole"))
-                return False, "MISSING_BLACKHOLE", "BlackHole input device not found"
+                    return False, "MAC_HELPER_BUILD_ERROR", f"{type(exc).__name__}: {exc}"
+                return True, "OK", str(helper_path)
 
             if sc is None:
                 return False, "MISSING_SOUNDCARD", "soundcard is not installed"
@@ -1331,10 +1449,6 @@ class AudioEngine:
     def _run(self) -> None:
         try:
             if IS_MAC:
-                if sd is None:
-                    self.state.set_error("sounddevice が見つかりません")
-                    self.detector.force_stop()
-                    return
                 self._run_mac()
             else:
                 if sc is None:
@@ -1355,51 +1469,165 @@ class AudioEngine:
             self.detector.force_stop()
             print(message, file=sys.stderr)
 
-    # ----- macOS / sounddevice -----
+    # ----- macOS / ScreenCaptureKit -----
     @staticmethod
-    def _find_blackhole_device() -> tuple[Optional[int], Optional[str]]:
-        devices = sd.query_devices()
-        for idx, dev in enumerate(devices):
-            if "BlackHole" in dev["name"] and int(dev.get("max_input_channels", 0)) > 0:
-                return idx, dev["name"]
-        return None, None
+    def _mac_helper_dir() -> Path:
+        return Path.home() / "Library" / "Caches" / "KariPomDesktop" / "ScreenCaptureKit"
+
+    def _ensure_macos_capture_helper(self) -> Path:
+        """開発用.py向けにScreenCaptureKit音声helperを一度だけビルドする。
+
+        将来の.app版ではこの実行ファイルをアプリに同梱し、このビルド工程自体を不要にする。
+        """
+        helper_dir = self._mac_helper_dir()
+        helper_dir.mkdir(parents=True, exist_ok=True)
+        source_path = helper_dir / "karipom_sck_audio.swift"
+        binary_path = helper_dir / "karipom_sck_audio"
+        stamp_path = helper_dir / "source.sha256"
+        digest = hashlib.sha256(MAC_SCK_HELPER_SOURCE.encode("utf-8")).hexdigest()
+
+        if binary_path.exists() and stamp_path.exists() and stamp_path.read_text().strip() == digest:
+            return binary_path
+
+        swiftc = shutil.which("swiftc")
+        if swiftc is None:
+            xcrun = shutil.which("xcrun")
+            if xcrun is not None:
+                probe = subprocess.run(
+                    [xcrun, "--find", "swiftc"], capture_output=True, text=True, check=False
+                )
+                if probe.returncode == 0:
+                    swiftc = probe.stdout.strip()
+        if not swiftc:
+            raise FileNotFoundError(
+                "Swift compilerが見つかりません。開発用.pyの検証にはXcode Command Line Toolsが必要です。"
+            )
+
+        source_path.write_text(MAC_SCK_HELPER_SOURCE, encoding="utf-8")
+        cmd = [
+            swiftc,
+            str(source_path),
+            "-O",
+            "-framework", "Foundation",
+            "-framework", "ScreenCaptureKit",
+            "-framework", "CoreMedia",
+            "-framework", "AudioToolbox",
+            "-o", str(binary_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "swiftc failed").strip()
+            raise RuntimeError(detail)
+        stamp_path.write_text(digest, encoding="utf-8")
+        return binary_path
+
+    @staticmethod
+    def _is_sck_permission_denied(detail: str) -> bool:
+        s = (detail or "").lower()
+        markers = (
+            "tcc", "permission", "not authorized", "not authorised",
+            "declined", "denied", "拒否", "許可",
+        )
+        return any(marker in s for marker in markers)
 
     def _run_mac(self) -> None:
+        # 権限拒否は再試行しても成功しないため即停止。
+        # スリープ復帰等の一時停止は 1→2→4 秒の指数バックオフでhelperを再生成せず再起動する。
+        restart_delay = 1.0
         while not self.stop_event.is_set():
-            device_id, device_name = self._find_blackhole_device()
-            if device_id is None:
-                msg = "BlackHole input device not found"
-                self.state.set_error(msg)
-                print(f"[audio] {msg}. {self.RESTART_WAIT:.0f}秒後に再検索します。", file=sys.stderr)
-                self.detector.force_stop()
-                self.stop_event.wait(self.RESTART_WAIT)
-                continue
-
-            self.state.set_error("")
-            print(f"Detected BlackHole: {device_name} = {device_id}")
-
-            def callback(indata, frames, time_info, status) -> None:  # noqa: ARG001
-                if status:
-                    print(f"Audio status: {status}", file=sys.stderr)
-                self._process_audio_block(indata[:, 0])
-
             try:
-                with sd.InputStream(
-                    device=device_id,
-                    channels=1,
-                    samplerate=SAMPLERATE,
-                    blocksize=BLOCKSIZE,
-                    callback=callback,
-                ):
-                    while not self.stop_event.wait(0.1):
-                        pass
-                    return
+                helper_path = self._ensure_macos_capture_helper()
             except Exception as exc:
-                msg = f"InputStream error: {type(exc).__name__}: {exc}"
-                self.state.set_error(msg)
+                msg = f"ScreenCaptureKit helper error: {type(exc).__name__}: {exc}"
+                self.state.set_error(msg, "SCK_HELPER_ERROR")
                 print(f"[audio] {msg}", file=sys.stderr)
                 self.detector.force_stop()
-                self.stop_event.wait(self.RESTART_WAIT)
+                return
+
+            self.state.clear_error()
+            print("Audio: macOS ScreenCaptureKit (BlackHole不要)")
+            proc = None
+            stderr_lines = []
+            try:
+                proc = subprocess.Popen(
+                    [str(helper_path)],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    bufsize=0,
+                )
+
+                def stderr_reader() -> None:
+                    assert proc is not None and proc.stderr is not None
+                    for raw in iter(proc.stderr.readline, b""):
+                        line = raw.decode("utf-8", errors="replace").strip()
+                        if line:
+                            stderr_lines.append(line)
+                            print(f"[ScreenCaptureKit] {line}", file=sys.stderr)
+
+                stderr_thread = threading.Thread(
+                    target=stderr_reader, name="KariPomSCKStderr", daemon=True
+                )
+                stderr_thread.start()
+
+                assert proc.stdout is not None
+                pending = bytearray()
+                bytes_per_block = BLOCKSIZE * 4  # Float32 mono
+                got_audio = False
+                while not self.stop_event.is_set():
+                    chunk = proc.stdout.read(max(4096, bytes_per_block - len(pending)))
+                    if not chunk:
+                        break
+                    got_audio = True
+                    restart_delay = 1.0  # 正常データを一度でも受け取れたら復旧バックオフをリセット。
+                    pending.extend(chunk)
+                    while len(pending) >= bytes_per_block:
+                        raw_block = bytes(pending[:bytes_per_block])
+                        del pending[:bytes_per_block]
+                        mono = np.frombuffer(raw_block, dtype=np.float32).copy()
+                        if mono.size == BLOCKSIZE:
+                            self._process_audio_block(mono)
+
+                if self.stop_event.is_set():
+                    if proc.poll() is None:
+                        proc.terminate()
+                    try:
+                        proc.wait(timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    return
+
+                rc = proc.wait(timeout=1.0) if proc.poll() is not None else None
+                detail = stderr_lines[-1] if stderr_lines else f"helper exited ({rc})"
+                self.detector.force_stop()
+                self.state.set_fft(np.zeros(8, dtype=np.float32))
+
+                if self._is_sck_permission_denied(detail):
+                    msg = "macOSの『画面とシステムオーディオの録音』権限が許可されていません。"
+                    self.state.set_error(msg, "SCK_PERMISSION_DENIED")
+                    print(f"[audio] ScreenCaptureKit permission denied: {detail}", file=sys.stderr)
+                    return
+
+                msg = f"ScreenCaptureKit capture stopped: {detail}"
+                self.state.set_error(msg, "SCK_STREAM_STOPPED")
+                print(f"[audio] {msg}", file=sys.stderr)
+                wait_s = restart_delay
+                restart_delay = min(restart_delay * 2.0, 4.0)
+                print(f"[audio] ScreenCaptureKitを{wait_s:.0f}秒後に再接続します。", file=sys.stderr)
+                if self.stop_event.wait(wait_s):
+                    return
+            except Exception as exc:
+                if proc is not None and proc.poll() is None:
+                    proc.terminate()
+                msg = f"ScreenCaptureKit capture error: {type(exc).__name__}: {exc}"
+                self.state.set_error(msg, "SCK_CAPTURE_ERROR")
+                print(f"[audio] {msg}", file=sys.stderr)
+                self.detector.force_stop()
+                self.state.set_fft(np.zeros(8, dtype=np.float32))
+                wait_s = restart_delay
+                restart_delay = min(restart_delay * 2.0, 4.0)
+                if self.stop_event.wait(wait_s):
+                    return
 
     # ----- Windows / Linux / soundcard -----
     @staticmethod
@@ -8099,6 +8327,49 @@ class FaceCanvas(QWidget):
         painter.end()
 
 
+class SplitNavButton(QPushButton):
+    """3分割ナビゲーションの左右操作領域を、文字列とは独立した細いシェブロンで示す。
+
+    ラベル文字は従来どおり中央配置のまま維持し、左右端にだけ薄い ‹ › 相当の
+    ベクター線を重ねることで、括弧に見えにくくしつつ前後操作を示す。
+    クリック判定そのもの（左1/3=前、中央1/3=no-op、右1/3=次）は変更しない。
+    """
+
+    def __init__(self, hint_rgb, parent=None):
+        super().__init__(parent)
+        self._hint_rgb = hint_rgb
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        color = QColor(*self._hint_rgb)
+        color.setAlpha(145)
+        pen = QPen(color)
+        pen.setWidthF(1.7)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+
+        # 文字から十分離れた左右端へ配置する。記号を文字列に含めないため、
+        # "‹ Character ›"のような括弧表現には見えない。
+        cy = self.height() * 0.5
+        span = max(4.0, min(7.0, self.height() * 0.095))
+        margin = max(9.0, min(15.0, self.width() * 0.065))
+        lx = margin
+        rx = self.width() - margin
+        dx = span * 0.55
+
+        painter.drawLine(QPointF(lx + dx, cy - span), QPointF(lx - dx, cy))
+        painter.drawLine(QPointF(lx - dx, cy), QPointF(lx + dx, cy + span))
+        painter.drawLine(QPointF(rx - dx, cy - span), QPointF(rx + dx, cy))
+        painter.drawLine(QPointF(rx + dx, cy), QPointF(rx - dx, cy + span))
+        painter.end()
+
+
 class KariPomWindow(QWidget):
     """トップレベルウィンドウ。v0.5 Phase 1でコンテナ化し、320x240キャンバス(FaceCanvas)
     の下にCharacter/Visualizer/Lightingの3ボタン行を配置する。"""
@@ -8146,9 +8417,9 @@ class KariPomWindow(QWidget):
         button_row.setContentsMargins(0, 0, 0, 0)
         button_row.setSpacing(0)
 
-        self.btn_character = QPushButton()
-        self.btn_visualizer = QPushButton()
-        self.btn_lighting = QPushButton()
+        self.btn_character = SplitNavButton(BTN_FG_ON_BLUE)
+        self.btn_visualizer = SplitNavButton(BTN_FG_ON_WHITE)
+        self.btn_lighting = SplitNavButton(BTN_FG_ON_RED)
         # v0.5 Phase 3.1: 落ち着いたトリコロール配色（青/白/赤）。hover/pressedは基本色の
         # 印象を壊さないわずかな明暗差のみで、新しい装飾（影・グラデーション等）は付けない。
         self.btn_character.setStyleSheet(self._button_style(BTN_BG_CHARACTER, BTN_FG_ON_BLUE))
@@ -8175,6 +8446,7 @@ class KariPomWindow(QWidget):
 
         self.title_timer = QTimer(self)
         self.title_timer.setInterval(20)
+        self._last_audio_error_code_shown = ""
         self.title_timer.timeout.connect(self._update_title)
         self.title_timer.start()
 
@@ -8182,7 +8454,15 @@ class KariPomWindow(QWidget):
         """Face以外のVisualizer/Randomへ切り替える直前の音声環境チェック。
         NGならダイアログを出し、呼び出し側は現在のFace状態を維持する。
         """
-        ok, code, detail = self.audio_engine.inspect_audio_environment()
+        if IS_MAC:
+            state_code, state_detail = self.canvas.audio_state.error_info()
+            if state_code == "SCK_PERMISSION_DENIED":
+                code, detail = state_code, state_detail
+                ok = False
+            else:
+                ok, code, detail = self.audio_engine.inspect_audio_environment()
+        else:
+            ok, code, detail = self.audio_engine.inspect_audio_environment()
         if ok:
             return True
 
@@ -8191,21 +8471,26 @@ class KariPomWindow(QWidget):
         box.setWindowTitle("Audio Visualizerを開始できません")
         action_btn = None
 
-        if code == "MISSING_SOUNDDEVICE":
-            box.setText("macOS用の音声ライブラリ sounddevice が見つかりません。")
+        if code == "SCK_PERMISSION_DENIED":
+            box.setText("macOSの『画面とシステムオーディオの録音』が許可されていません。")
             box.setInformativeText(
-                "KariPom DesktopでPC音声に反応するには sounddevice が必要です。\n\n"
-                "pip install sounddevice\n\n"
-                "インストール後はKariPom Desktopを再起動し、もう一度Visualizerを選んでください。"
+                "システム設定でKariPom（開発用.pyではTerminal）を許可し、KariPom Desktopを再起動してください。"
             )
-        elif code == "MISSING_BLACKHOLE":
-            box.setText("BlackHole 2ch が見つかりません。")
+            action_btn = box.addButton("システム設定を開く", QMessageBox.ActionRole)
+        elif code == "UNSUPPORTED_MACOS":
+            box.setText("このmacOSではPC再生音の直接取得を利用できません。")
             box.setInformativeText(
-                "macOSでPCの再生音をAudio Visualizerへ渡すには BlackHole 2ch が必要です。\n"
-                "インストール後、Audio MIDI設定で『複数出力装置』も設定してください。\n\n"
-                "準備後、もう一度Visualizerを選んでください。"
+                "BlackHoleを使わないKariPom DesktopのMac音声取得にはmacOS 13以降が必要です。"
             )
-            action_btn = box.addButton("BlackHoleを入手", QMessageBox.ActionRole)
+        elif code == "MISSING_SWIFTC":
+            box.setText("開発用ScreenCaptureKit helperを準備できません。")
+            box.setInformativeText(
+                "この.py検証版では初回だけXcode Command Line ToolsのSwift compilerが必要です。\n\n"
+                "将来の.app配布版ではhelperを同梱するため、この準備は不要になります。"
+            )
+        elif code == "MAC_HELPER_BUILD_ERROR":
+            box.setText("ScreenCaptureKit helperのビルドに失敗しました。")
+            box.setInformativeText(f"{detail}\n\n設定を確認後、KariPom Desktopを再起動してください。")
         elif code == "MISSING_SOUNDCARD":
             box.setText("Windows/Linux用の音声ライブラリ soundcard が見つかりません。")
             extra = "\nLinuxでは libpulse0（PipeWire環境では pipewire-pulse）も確認してください。" if IS_LINUX else ""
@@ -8236,8 +8521,8 @@ class KariPomWindow(QWidget):
 
         box.addButton("閉じる", QMessageBox.RejectRole)
         box.exec_()
-        if action_btn is not None and box.clickedButton() is action_btn:
-            webbrowser.open("https://existential.audio/blackhole/", new=2)
+        if action_btn is not None and box.clickedButton() is action_btn and code == "SCK_PERMISSION_DENIED":
+            self._open_macos_screen_recording_settings()
         return False
 
     def eventFilter(self, obj, event):
@@ -8369,6 +8654,46 @@ class KariPomWindow(QWidget):
         light_label = "Random" if c.lighting_random_on() else LIGHT_MODES[c.light_manual_index]
         self._set_button_text(self.btn_lighting, "Lighting:", light_label)
 
+    @staticmethod
+    def _open_macos_screen_recording_settings() -> None:
+        # macOSの該当TCC設定を直接開く。開けない環境では通常の設定アプリ起動へフォールバック。
+        url = "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+        try:
+            if not webbrowser.open(url):
+                subprocess.Popen(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"])
+        except Exception:
+            try:
+                subprocess.Popen(["open", "/System/Applications/System Settings.app"])
+            except Exception:
+                pass
+
+    def _show_audio_error_if_needed(self) -> None:
+        code, detail = self.canvas.audio_state.error_info()
+        if not code:
+            self._last_audio_error_code_shown = ""
+            return
+        if code == self._last_audio_error_code_shown:
+            return
+        self._last_audio_error_code_shown = code
+
+        if code != "SCK_PERMISSION_DENIED":
+            return
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("macOSの音声取得を許可してください")
+        box.setText("KariPomがMacの再生音に反応するには、macOSの許可が必要です。")
+        box.setInformativeText(
+            "システム設定の『プライバシーとセキュリティ』→『画面とシステムオーディオの録音』で、"
+            "KariPom（開発用.pyではTerminal）を許可してください。\n\n"
+            "許可後はKariPom Desktopを再起動してください。"
+        )
+        settings_btn = box.addButton("システム設定を開く", QMessageBox.ActionRole)
+        box.addButton("閉じる", QMessageBox.RejectRole)
+        box.exec_()
+        if box.clickedButton() is settings_btn:
+            self._open_macos_screen_recording_settings()
+
     def _update_title(self) -> None:
         speaking, _rms, error, _fft = self.canvas.audio_state.snapshot()
         mode_label = "Random" if self.canvas.visualizer_random_on() else VIS_MODES[self.canvas.viz_manual_index]
@@ -8378,6 +8703,7 @@ class KariPomWindow(QWidget):
         elif speaking:
             title += "  [Talking]"
         self.setWindowTitle(title)
+        self._show_audio_error_if_needed()
 
     def closeEvent(self, event) -> None:
         self.canvas.timer.stop()
@@ -8388,10 +8714,7 @@ class KariPomWindow(QWidget):
 
 def print_devices() -> None:
     if IS_MAC:
-        if sd is None:
-            print("sounddevice が見つかりません。pip install sounddevice")
-            return
-        print(sd.query_devices())
+        print("macOS: ScreenCaptureKitでPC再生音を直接取得します（BlackHole不要）。")
         return
 
     if sc is None:
@@ -8434,7 +8757,7 @@ def main() -> int:
     print(f"OS: {OS_NAME}")
     print(f"Threshold: {args.threshold}")
     if IS_MAC:
-        print("Audio: BlackHole")
+        print("Audio: ScreenCaptureKit (BlackHole不要)")
     else:
         print("Audio: WASAPI Loopback" if IS_WINDOWS else "Audio: PulseAudio/PipeWire monitor")
         print(f"Keepalive: {'OFF' if args.no_keepalive else 'ON'}")
