@@ -28,9 +28,10 @@
 #              Hypnotic Vortex/Rainbow Washing Machine）＋Lighting Random(3分)
 #   * Phase 4a: 中難度LightingのうちEye Slot・Flower Clockを追加（顔レイヤー特殊フック：
 #              Eye Slotは黒目をリールへ差し替え、Flower Clockは針を顔より最前面に描画）
-#   * Phase 4b以降: 残りの中〜高難度Lightingを順次追加予定（未実装）
+#   * Phase 4b〜5C: 残りの中〜高難度Lightingを順次追加し、CoreS3と同じ全24種の
+#              Lighting移植が完了（各Phaseの詳細はLIGHT_MODES定義前のコメントを参照）
 #   * バージョン表記（本コメント含む5箇所）・README・操作説明は、KariPom Desktop v0.5
-#     正式リリースに合わせてv0.5表記へ更新した（Phase 4b以降の残りLighting移植は継続予定）。
+#     正式リリースに合わせてv0.5表記へ更新した。
 #
 # 必要パッケージ:
 #   共通            : pip install numpy PyQt5
