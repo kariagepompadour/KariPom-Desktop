@@ -64,7 +64,7 @@ try:
     from PyQt5.QtCore import QTimer, Qt, QPointF, QEvent
     from PyQt5.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter, QPen
     from PyQt5.QtWidgets import (
-        QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+        QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QMessageBox,
     )
 except ImportError as exc:
     print("PyQt5 が必要です。")
@@ -81,22 +81,20 @@ if not (IS_MAC or IS_WINDOWS or IS_LINUX):
     print(f"未対応OSです: {OS_NAME}")
     raise SystemExit(1)
 
+# 音声ライブラリはVisualizer/PC音声反応のための任意依存。
+# 未導入でもKariPom Desktop自体は起動し、Visualizer選択時に案内する。
+sd = None
+sc = None
 if IS_MAC:
     try:
         import sounddevice as sd
-    except ImportError as exc:
-        print("macOSでは sounddevice が必要です。")
-        print("  pip install sounddevice")
-        raise SystemExit(1) from exc
+    except ImportError:
+        pass
 else:
     try:
         import soundcard as sc
-    except ImportError as exc:
-        print("Windows/Linuxでは soundcard が必要です。")
-        print("  pip install soundcard")
-        if IS_LINUX:
-            print("Linuxでは libpulse0 も必要です。")
-        raise SystemExit(1) from exc
+    except ImportError:
+        pass
 
 
 # ===== karipom_talk 最終版と同じ音声判定値 =====
@@ -1296,11 +1294,53 @@ class AudioEngine:
         self.stop_event.set()
         self.detector.force_stop()
 
+    def inspect_audio_environment(self):
+        """Visualizer開始前に、OSごとのPC再生音取得環境を副作用なしで確認する。
+
+        Returns:
+            (ok, code, detail)
+            code: OK / MISSING_SOUNDDEVICE / MISSING_BLACKHOLE /
+                  MISSING_SOUNDCARD / MISSING_LOOPBACK / AUDIO_CHECK_ERROR
+        """
+        try:
+            if IS_MAC:
+                if sd is None:
+                    return False, "MISSING_SOUNDDEVICE", "sounddevice is not installed"
+                try:
+                    devices = sd.query_devices()
+                except Exception as exc:
+                    return False, "AUDIO_CHECK_ERROR", f"{type(exc).__name__}: {exc}"
+                for dev in devices:
+                    if "BlackHole" in str(dev.get("name", "")) and int(dev.get("max_input_channels", 0)) > 0:
+                        return True, "OK", str(dev.get("name", "BlackHole"))
+                return False, "MISSING_BLACKHOLE", "BlackHole input device not found"
+
+            if sc is None:
+                return False, "MISSING_SOUNDCARD", "soundcard is not installed"
+            try:
+                mics = sc.all_microphones(include_loopback=True)
+                loopbacks = [mic for mic in mics if self._is_loopback_mic(mic)]
+            except Exception as exc:
+                return False, "AUDIO_CHECK_ERROR", f"{type(exc).__name__}: {exc}"
+            if loopbacks:
+                return True, "OK", str(loopbacks[0].name)
+            return False, "MISSING_LOOPBACK", "PC playback loopback/monitor source not found"
+        except Exception as exc:
+            return False, "AUDIO_CHECK_ERROR", f"{type(exc).__name__}: {exc}"
+
     def _run(self) -> None:
         try:
             if IS_MAC:
+                if sd is None:
+                    self.state.set_error("sounddevice が見つかりません")
+                    self.detector.force_stop()
+                    return
                 self._run_mac()
             else:
+                if sc is None:
+                    self.state.set_error("soundcard が見つかりません")
+                    self.detector.force_stop()
+                    return
                 if self.options.keepalive:
                     self.keepalive_thread = threading.Thread(
                         target=self._keepalive_loop,
@@ -8138,6 +8178,68 @@ class KariPomWindow(QWidget):
         self.title_timer.timeout.connect(self._update_title)
         self.title_timer.start()
 
+    def _ensure_visualizer_ready(self) -> bool:
+        """Face以外のVisualizer/Randomへ切り替える直前の音声環境チェック。
+        NGならダイアログを出し、呼び出し側は現在のFace状態を維持する。
+        """
+        ok, code, detail = self.audio_engine.inspect_audio_environment()
+        if ok:
+            return True
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Audio Visualizerを開始できません")
+        action_btn = None
+
+        if code == "MISSING_SOUNDDEVICE":
+            box.setText("macOS用の音声ライブラリ sounddevice が見つかりません。")
+            box.setInformativeText(
+                "KariPom DesktopでPC音声に反応するには sounddevice が必要です。\n\n"
+                "pip install sounddevice\n\n"
+                "インストール後はKariPom Desktopを再起動し、もう一度Visualizerを選んでください。"
+            )
+        elif code == "MISSING_BLACKHOLE":
+            box.setText("BlackHole 2ch が見つかりません。")
+            box.setInformativeText(
+                "macOSでPCの再生音をAudio Visualizerへ渡すには BlackHole 2ch が必要です。\n"
+                "インストール後、Audio MIDI設定で『複数出力装置』も設定してください。\n\n"
+                "準備後、もう一度Visualizerを選んでください。"
+            )
+            action_btn = box.addButton("BlackHoleを入手", QMessageBox.ActionRole)
+        elif code == "MISSING_SOUNDCARD":
+            box.setText("Windows/Linux用の音声ライブラリ soundcard が見つかりません。")
+            extra = "\nLinuxでは libpulse0（PipeWire環境では pipewire-pulse）も確認してください。" if IS_LINUX else ""
+            box.setInformativeText(
+                "KariPom DesktopでPC音声に反応するには soundcard が必要です。\n\n"
+                "pip install soundcard" + extra +
+                "\n\nインストール後はKariPom Desktopを再起動し、もう一度Visualizerを選んでください。"
+            )
+        elif code == "MISSING_LOOPBACK":
+            if IS_WINDOWS:
+                box.setText("WindowsのPC再生音ループバックが見つかりません。")
+                box.setInformativeText(
+                    "通常、追加の仮想オーディオソフトは不要です。Windowsの再生デバイスが有効になっていることを確認してください。\n\n"
+                    "確認後、もう一度Visualizerを選んでください。"
+                )
+            else:
+                box.setText("Linuxのmonitor sourceが見つかりません。")
+                box.setInformativeText(
+                    "PulseAudio / PipeWire のmonitor sourceを利用できる状態にしてください。"
+                    "libpulse0、PipeWire環境ではpipewire-pulseも確認してください。\n\n"
+                    "確認後、もう一度Visualizerを選んでください。"
+                )
+        else:
+            box.setText("PC音声環境を確認できませんでした。")
+            box.setInformativeText(
+                f"{detail}\n\n設定を確認後、もう一度Visualizerを選んでください。"
+            )
+
+        box.addButton("閉じる", QMessageBox.RejectRole)
+        box.exec_()
+        if action_btn is not None and box.clickedButton() is action_btn:
+            webbrowser.open("https://existential.audio/blackhole/", new=2)
+        return False
+
     def eventFilter(self, obj, event):
         """下部3ボタン: 左1/3で前、中央1/3は無操作、右1/3で次へ切り替える。"""
         if obj in (self.btn_character, self.btn_visualizer, self.btn_lighting):
@@ -8157,6 +8259,19 @@ class KariPomWindow(QWidget):
                 if obj is self.btn_character:
                     self.canvas.cycle_character(direction)
                 elif obj is self.btn_visualizer:
+                    next_index = (
+                        self.canvas.viz_manual_index + (1 if direction >= 0 else -1)
+                    ) % (len(VIS_MODES) + 1)
+                    # Face(index 0)へ戻る操作は常に許可。
+                    # Face以外／Randomへ入る前だけ音声環境を確認し、NGなら状態を変えない。
+                    if next_index != 0 and not self._ensure_visualizer_ready():
+                        self.canvas.viz_manual_index = 0
+                        self.canvas.viz_display_mode = 0
+                        self.canvas.viz_random_last_switch_ms = 0
+                        self.canvas.viz_random_last_pick = -1
+                        self.canvas.update()
+                        self._refresh_buttons()
+                        return True
                     self.canvas.cycle_visualizer(direction)
                 else:
                     self.canvas.cycle_lighting(direction)
@@ -8273,9 +8388,15 @@ class KariPomWindow(QWidget):
 
 def print_devices() -> None:
     if IS_MAC:
+        if sd is None:
+            print("sounddevice が見つかりません。pip install sounddevice")
+            return
         print(sd.query_devices())
         return
 
+    if sc is None:
+        print("soundcard が見つかりません。pip install soundcard")
+        return
     print("=== 音声デバイス一覧（[loopback] がPC再生音の候補）===")
     for mic in sc.all_microphones(include_loopback=True):
         loopback = getattr(mic, "isloopback", False) or str(getattr(mic, "id", "")).endswith(".monitor")
