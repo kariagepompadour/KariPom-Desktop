@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =============================================================================
-# KariPom Desktop v0.4 - 7 Visualizers + Face
+# KariPom Desktop v0.5 - 7 Visualizers + Face
 # PCだけで「かりポム」を体験するスピンアウト版
 #
 # ベース:
@@ -29,8 +29,8 @@
 #   * Phase 4a: 中難度LightingのうちEye Slot・Flower Clockを追加（顔レイヤー特殊フック：
 #              Eye Slotは黒目をリールへ差し替え、Flower Clockは針を顔より最前面に描画）
 #   * Phase 4b以降: 残りの中〜高難度Lightingを順次追加予定（未実装）
-#   * バージョン表記（本コメント含む5箇所）・README・操作説明は、全Lighting移植など
-#     機能実装が完了した最終段階でv0.5表記へ統一する予定（今回はまだ更新しない）。
+#   * バージョン表記（本コメント含む5箇所）・README・操作説明は、KariPom Desktop v0.5
+#     正式リリースに合わせてv0.5表記へ更新した（Phase 4b以降の残りLighting移植は継続予定）。
 #
 # 必要パッケージ:
 #   共通            : pip install numpy PyQt5
@@ -8242,7 +8242,7 @@ class KariPomWindow(QWidget):
         self.canvas = FaceCanvas(audio_state, scale)
 
         self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-        self.setWindowTitle("KariPom Desktop v0.4  [Face]  • Always on top")
+        self.setWindowTitle("KariPom Desktop v0.5  [Face]  • Always on top")
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -8556,7 +8556,7 @@ class KariPomWindow(QWidget):
     def _update_title(self) -> None:
         speaking, _rms, error, _fft = self.canvas.audio_state.snapshot()
         mode_label = "Random" if self.canvas.visualizer_random_on() else VIS_MODES[self.canvas.viz_manual_index]
-        title = f"KariPom Desktop v0.4  [{mode_label}]  • Always on top"
+        title = f"KariPom Desktop v0.5  [{mode_label}]  • Always on top"
         if error:
             title += "  [Audio Error]"
         elif speaking:
@@ -8591,7 +8591,7 @@ def print_devices() -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="KariPom Desktop v0.4 - 7 Visualizers + Face")
+    parser = argparse.ArgumentParser(description="KariPom Desktop v0.5 - 7 Visualizers + Face")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,
                         help=f"口パク開始RMSしきい値（既定 {DEFAULT_THRESHOLD}）")
     parser.add_argument("--input", dest="input_hint", default=None,
@@ -8612,7 +8612,7 @@ def main() -> int:
         print_devices()
         return 0
 
-    print("=== KariPom Desktop v0.4 - 7 Visualizers + Face ===")
+    print("=== KariPom Desktop v0.5 - 7 Visualizers + Face ===")
     print(f"OS: {OS_NAME}")
     print(f"Threshold: {args.threshold}")
     if IS_MAC:
