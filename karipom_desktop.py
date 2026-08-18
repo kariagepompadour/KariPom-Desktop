@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # =============================================================================
-# KariPom Desktop v0.5 - 7 Visualizers + Face
+# KariPom Desktop v0.5.1 - 7 Visualizers + Face
 # PCだけで「かりポム」を体験するスピンアウト版
 #
 # ベース:
@@ -1034,6 +1034,27 @@ def detect_ui_lang() -> str:
         val = os.environ.get(env_key)
         if val:
             candidates.append(val)
+
+    # Finder から起動した .app は Terminal の LANG/LC_* を引き継がないことがある。
+    # macOS ではシステムの「優先する言語」を直接読み、.py 実行時と .app 実行時で
+    # UI/起動挨拶の言語判定がずれないようにする。
+    if IS_MAC:
+        try:
+            defaults = shutil.which("defaults") or "/usr/bin/defaults"
+            result = subprocess.run(
+                [defaults, "read", "-g", "AppleLanguages"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0:
+                for line in result.stdout.splitlines():
+                    lang = line.strip().rstrip(',').strip().strip('"')
+                    if lang and lang not in ("(", ")"):
+                        candidates.append(lang)
+        except Exception:
+            pass
+
     if IS_WINDOWS:
         try:
             import ctypes
@@ -8243,7 +8264,7 @@ class KariPomWindow(QWidget):
         self.canvas = FaceCanvas(audio_state, scale)
 
         self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-        self.setWindowTitle("KariPom Desktop v0.5  [Face]  • Always on top")
+        self.setWindowTitle("KariPom Desktop v0.5.1  [Face]  • Always on top")
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -8557,7 +8578,7 @@ class KariPomWindow(QWidget):
     def _update_title(self) -> None:
         speaking, _rms, error, _fft = self.canvas.audio_state.snapshot()
         mode_label = "Random" if self.canvas.visualizer_random_on() else VIS_MODES[self.canvas.viz_manual_index]
-        title = f"KariPom Desktop v0.5  [{mode_label}]  • Always on top"
+        title = f"KariPom Desktop v0.5.1  [{mode_label}]  • Always on top"
         if error:
             title += "  [Audio Error]"
         elif speaking:
@@ -8592,7 +8613,7 @@ def print_devices() -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="KariPom Desktop v0.5 - 7 Visualizers + Face")
+    parser = argparse.ArgumentParser(description="KariPom Desktop v0.5.1 - 7 Visualizers + Face")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,
                         help=f"口パク開始RMSしきい値（既定 {DEFAULT_THRESHOLD}）")
     parser.add_argument("--input", dest="input_hint", default=None,
@@ -8613,7 +8634,7 @@ def main() -> int:
         print_devices()
         return 0
 
-    print("=== KariPom Desktop v0.5 - 7 Visualizers + Face ===")
+    print("=== KariPom Desktop v0.5.1 - 7 Visualizers + Face ===")
     print(f"OS: {OS_NAME}")
     print(f"Threshold: {args.threshold}")
     if IS_MAC:
