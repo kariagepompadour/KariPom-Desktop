@@ -1,4 +1,6 @@
 
+
+[English README](README_EN.md)
 # 🐰 KariPom Desktop
 
 https://github.com/user-attachments/assets/52b32f2c-2d1d-4204-99f6-da0b9c77525a
