@@ -10,6 +10,18 @@ KariPom Desktop analyzes audio playing on your PC and makes the on-screen KariPo
 
 This standalone PC version grew out of the lip-sync feature of the original KariPom face robot built with Arduino and CoreS3.
 
+## 🌐 Try KariPom Web — No Installation Required!
+
+Want to see KariPom in action before installing KariPom Desktop?
+
+**KariPom Web** is a browser-based version that lets you enjoy KariPom's lip-sync and audio-reactive animations without installing any software or using dedicated hardware.
+
+KariPom reacts in real time to audio playing on your PC, including voice conversations with ChatGPT and audio from YouTube.
+
+**🐰 [Try KariPom Web](https://kariagepompadour.github.io/KariPom-Web/)**
+
+*Note: Requires a compatible desktop browser on Windows or macOS. Audio-reactive features are not supported on smartphones.*
+
 KariPom Desktop is a Python application that analyzes audio played on your PC, including ChatGPT's voice, and animates KariPom's mouth accordingly.
 
 Even when no one is speaking, KariPom stays on your desktop, blinking and twitching its nose.
